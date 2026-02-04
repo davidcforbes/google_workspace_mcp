@@ -158,10 +158,12 @@ def extract_session_from_headers(headers: Dict[str, str]) -> Optional[str]:
         if token:
             # Look for a session that has this access token
             # This requires scanning sessions, but bearer tokens should be unique
+            # THREAD-SAFETY: Must acquire lock before accessing _sessions
             store = get_oauth21_session_store()
-            for user_email, session_info in store._sessions.items():
-                if session_info.get("access_token") == token:
-                    return session_info.get("session_id") or f"bearer_{user_email}"
+            with store._lock:
+                for user_email, session_info in store._sessions.items():
+                    if session_info.get("access_token") == token:
+                        return session_info.get("session_id") or f"bearer_{user_email}"
 
         # If no session found, create a temporary session ID from token hash
         # This allows header-based authentication to work with session context
@@ -196,8 +198,8 @@ class OAuth21SessionStore:
             str, str
         ] = {}  # Maps FastMCP session ID -> user email
         self._session_auth_binding: Dict[
-            str, str
-        ] = {}  # Maps session ID -> authenticated user email (immutable)
+            str, Dict[str, Any]
+        ] = {}  # Maps session ID -> {user_email, created_at} for auth binding with expiry
         self._oauth_states: Dict[str, Dict[str, Any]] = {}
         self._lock = RLock()
 
@@ -216,6 +218,25 @@ class OAuth21SessionStore:
                 state[:8] if len(state) > 8 else state,
             )
 
+    def _cleanup_expired_session_bindings_locked(self):
+        """Remove expired session auth bindings. Caller must hold lock."""
+        now = datetime.now(timezone.utc)
+        max_age = timedelta(hours=24)  # Bindings expire after 24 hours
+
+        expired_sessions = []
+        for session_id, binding_data in self._session_auth_binding.items():
+            created_at = binding_data.get("created_at")
+            if created_at and (now - created_at) > max_age:
+                expired_sessions.append(session_id)
+
+        for session_id in expired_sessions:
+            user_email = self._session_auth_binding[session_id].get("user_email")
+            del self._session_auth_binding[session_id]
+            logger.info(
+                f"Removed expired session binding: {session_id[:8]}... -> {user_email} "
+                f"(age > 24 hours)"
+            )
+
     def store_oauth_state(
         self,
         state: str,
@@ -230,6 +251,7 @@ class OAuth21SessionStore:
 
         with self._lock:
             self._cleanup_expired_oauth_states_locked()
+            self._cleanup_expired_session_bindings_locked()
             now = datetime.now(timezone.utc)
             expiry = now + timedelta(seconds=expires_in_seconds)
             self._oauth_states[state] = {
@@ -266,6 +288,7 @@ class OAuth21SessionStore:
 
         with self._lock:
             self._cleanup_expired_oauth_states_locked()
+            self._cleanup_expired_session_bindings_locked()
             state_info = self._oauth_states.get(state)
 
             if not state_info:
@@ -336,6 +359,9 @@ class OAuth21SessionStore:
                 "session_id": session_id,
                 "mcp_session_id": mcp_session_id,
                 "issuer": issuer,
+                "created_at": datetime.now(
+                    timezone.utc
+                ),  # Track when session was created
             }
 
             self._sessions[user_email] = session_info
@@ -343,15 +369,25 @@ class OAuth21SessionStore:
             # Store MCP session mapping if provided
             if mcp_session_id:
                 # Create immutable session binding (first binding wins, cannot be changed)
+                # Now includes timestamp for expiry tracking
                 if mcp_session_id not in self._session_auth_binding:
-                    self._session_auth_binding[mcp_session_id] = user_email
+                    self._session_auth_binding[mcp_session_id] = {
+                        "user_email": user_email,
+                        "created_at": datetime.now(timezone.utc),
+                    }
                     logger.info(
                         f"Created immutable session binding: {mcp_session_id} -> {user_email}"
                     )
-                elif self._session_auth_binding[mcp_session_id] != user_email:
+                elif (
+                    self._session_auth_binding[mcp_session_id].get("user_email")
+                    != user_email
+                ):
                     # Security: Attempt to bind session to different user
+                    existing_user = self._session_auth_binding[mcp_session_id].get(
+                        "user_email"
+                    )
                     logger.error(
-                        f"SECURITY: Attempt to rebind session {mcp_session_id} from {self._session_auth_binding[mcp_session_id]} to {user_email}"
+                        f"SECURITY: Attempt to rebind session {mcp_session_id} from {existing_user} to {user_email}"
                     )
                     raise ValueError(
                         f"Session {mcp_session_id} is already bound to a different user"
@@ -368,7 +404,10 @@ class OAuth21SessionStore:
 
             # Also create binding for the OAuth session ID
             if session_id and session_id not in self._session_auth_binding:
-                self._session_auth_binding[session_id] = user_email
+                self._session_auth_binding[session_id] = {
+                    "user_email": user_email,
+                    "created_at": datetime.now(timezone.utc),
+                }
 
     def get_credentials(self, user_email: str) -> Optional[Credentials]:
         """
@@ -462,16 +501,18 @@ class OAuth21SessionStore:
 
             # Priority 2: Check session binding
             if session_id:
-                bound_user = self._session_auth_binding.get(session_id)
-                if bound_user:
-                    if bound_user != requested_user_email:
+                binding_data = self._session_auth_binding.get(session_id)
+                if binding_data:
+                    bound_user = binding_data.get("user_email")
+                    if bound_user and bound_user != requested_user_email:
                         logger.error(
                             f"SECURITY VIOLATION: Session {session_id} (bound to {bound_user}) "
                             f"attempted to access credentials for {requested_user_email}"
                         )
                         return None
                     # Session binding matches, allow access
-                    return self.get_credentials(requested_user_email)
+                    if bound_user == requested_user_email:
+                        return self.get_credentials(requested_user_email)
 
                 # Check if this is an MCP session
                 mcp_user = self._mcp_session_mapping.get(session_id)
@@ -487,6 +528,7 @@ class OAuth21SessionStore:
 
             # Special case: Allow access if user has recently authenticated (for clients that don't send tokens)
             # CRITICAL SECURITY: This is ONLY allowed in stdio mode, NEVER in OAuth 2.1 mode
+            # AND only within 5 minutes of session creation
             if allow_recent_auth and requested_user_email in self._sessions:
                 # Check transport mode to ensure this is only used in stdio
                 try:
@@ -503,10 +545,34 @@ class OAuth21SessionStore:
                     logger.error(f"Failed to check transport mode: {e}")
                     return None
 
-                logger.info(
-                    f"Allowing credential access for {requested_user_email} based on recent authentication "
-                    f"(stdio mode only - client not sending bearer token)"
-                )
+                # Check if session was created within the last 5 minutes
+                session_info = self._sessions.get(requested_user_email)
+                created_at = session_info.get("created_at")
+                if created_at:
+                    now = datetime.now(timezone.utc)
+                    age = now - created_at
+                    max_age = timedelta(minutes=5)
+
+                    if age > max_age:
+                        logger.warning(
+                            f"SECURITY: Credential access denied for {requested_user_email}: "
+                            f"Session too old ({age.total_seconds():.0f}s > {max_age.total_seconds():.0f}s). "
+                            f"Recent auth only allowed within 5 minutes of authentication."
+                        )
+                        return None
+
+                    logger.info(
+                        f"Allowing credential access for {requested_user_email} based on recent authentication "
+                        f"(stdio mode, session age: {age.total_seconds():.0f}s)"
+                    )
+                else:
+                    # No created_at timestamp (old session format) - deny for security
+                    logger.warning(
+                        f"SECURITY: Credential access denied for {requested_user_email}: "
+                        f"Session has no created_at timestamp (legacy format)"
+                    )
+                    return None
+
                 return self.get_credentials(requested_user_email)
 
             # No session or token info available - deny access for security

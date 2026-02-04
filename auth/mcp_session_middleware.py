@@ -62,24 +62,11 @@ class MCPSessionMiddleware(BaseHTTPMiddleware):
                 mcp_session_id = request.state.session_id
                 logger.debug(f"Found FastMCP session ID: {mcp_session_id}")
 
-            # Also check Authorization header for bearer tokens
-            auth_header = headers.get("authorization")
-            if (
-                auth_header
-                and auth_header.lower().startswith("bearer ")
-                and not user_email
-            ):
-                try:
-                    import jwt
-
-                    token = auth_header[7:]  # Remove "Bearer " prefix
-                    # Decode without verification to extract email
-                    claims = jwt.decode(token, options={"verify_signature": False})
-                    user_email = claims.get("email")
-                    if user_email:
-                        logger.debug(f"Extracted user email from JWT: {user_email}")
-                except Exception:
-                    pass
+            # NOTE: We do NOT extract user_email from bearer tokens here.
+            # JWT validation and email extraction MUST be done by FastMCP's auth provider.
+            # The user_email should only come from request.state.auth.claims which has
+            # already been cryptographically verified by FastMCP.
+            # Extracting email from unverified JWTs would allow authentication bypass attacks.
 
             # Build session context
             if session_id or auth_context or user_email or mcp_session_id:

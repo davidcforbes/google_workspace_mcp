@@ -145,12 +145,23 @@ class LocalDirectoryCredentialStore(CredentialStore):
                 except (ValueError, TypeError) as e:
                     logger.warning(f"Could not parse expiry time for {user_email}: {e}")
 
+            # SECURITY: Fetch client_id and client_secret from environment variables
+            # instead of storing them in credential files. This prevents exposure
+            # of the OAuth client secret if the file system is compromised.
+            from auth.oauth_config import get_oauth_config
+
+            config = get_oauth_config()
+
+            # Use stored values as fallback for backward compatibility with old credential files
+            client_id = config.client_id or creds_data.get("client_id")
+            client_secret = config.client_secret or creds_data.get("client_secret")
+
             credentials = Credentials(
                 token=creds_data.get("token"),
                 refresh_token=creds_data.get("refresh_token"),
                 token_uri=creds_data.get("token_uri"),
-                client_id=creds_data.get("client_id"),
-                client_secret=creds_data.get("client_secret"),
+                client_id=client_id,
+                client_secret=client_secret,
                 scopes=creds_data.get("scopes"),
                 expiry=expiry,
             )
@@ -168,20 +179,30 @@ class LocalDirectoryCredentialStore(CredentialStore):
         """Store credentials to local JSON file."""
         creds_path = self._get_credential_path(user_email)
 
+        # SECURITY: Do NOT store client_secret in credential files.
+        # The client_secret should be configured via environment variables
+        # (GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET) and will be
+        # fetched from there when credentials are loaded.
         creds_data = {
             "token": credentials.token,
             "refresh_token": credentials.refresh_token,
             "token_uri": credentials.token_uri,
             "client_id": credentials.client_id,
-            "client_secret": credentials.client_secret,
+            # client_secret deliberately omitted for security
             "scopes": credentials.scopes,
             "expiry": credentials.expiry.isoformat() if credentials.expiry else None,
         }
 
         try:
-            with open(creds_path, "w") as f:
+            # Write the file with restrictive permissions (0600 - owner read/write only)
+            # Create file with secure permissions before writing
+            fd = os.open(creds_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(creds_data, f, indent=2)
-            logger.info(f"Stored credentials for {user_email} to {creds_path}")
+
+            logger.info(
+                f"Stored credentials for {user_email} to {creds_path} with 0600 permissions"
+            )
             return True
         except IOError as e:
             logger.error(

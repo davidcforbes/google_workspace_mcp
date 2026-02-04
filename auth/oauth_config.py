@@ -9,8 +9,12 @@ Supports both OAuth 2.0 and OAuth 2.1 with automatic client capability detection
 """
 
 import os
+import logging
+import threading
 from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 class OAuthConfig:
@@ -134,7 +138,22 @@ class OAuthConfig:
         # Custom redirect URIs from environment
         custom_uris = os.getenv("OAUTH_CUSTOM_REDIRECT_URIS")
         if custom_uris:
-            uris.extend([uri.strip() for uri in custom_uris.split(",")])
+            custom_uri_list = [
+                uri.strip() for uri in custom_uris.split(",") if uri.strip()
+            ]
+            for uri in custom_uri_list:
+                # Validate and log custom redirect URIs
+                if self._validate_uri_structure(uri):
+                    uris.append(uri)
+                    logger.warning(
+                        f"SECURITY: Custom redirect URI added from environment: {uri}. "
+                        "Ensure this URI is trusted and properly configured in your OAuth app."
+                    )
+                else:
+                    logger.error(
+                        f"SECURITY: Invalid custom redirect URI rejected: {uri}. "
+                        "URI must be a valid URL with proper scheme and host."
+                    )
 
         # Remove duplicates while preserving order
         return list(dict.fromkeys(uris))
@@ -190,9 +209,58 @@ class OAuthConfig:
             return self.external_url
         return self.base_url
 
+    def _validate_uri_structure(self, uri: str) -> bool:
+        """
+        Validate the structure of a redirect URI for security.
+
+        Args:
+            uri: The URI to validate
+
+        Returns:
+            True if URI structure is valid, False otherwise
+        """
+        try:
+            parsed = urlparse(uri)
+
+            # Must have a scheme
+            if not parsed.scheme:
+                logger.warning(f"Invalid URI (no scheme): {uri}")
+                return False
+
+            # Scheme must be http or https
+            if parsed.scheme not in ["http", "https"]:
+                logger.warning(f"Invalid URI (unsupported scheme): {uri}")
+                return False
+
+            # Must have a netloc (host)
+            if not parsed.netloc:
+                logger.warning(f"Invalid URI (no host): {uri}")
+                return False
+
+            # For production (non-localhost), enforce HTTPS
+            is_localhost = (
+                parsed.netloc.startswith("localhost")
+                or parsed.netloc.startswith("127.0.0.1")
+                or parsed.netloc.startswith("[::1]")
+            )
+            if not is_localhost and parsed.scheme != "https":
+                logger.warning(
+                    f"SECURITY: Non-localhost redirect URI should use HTTPS: {uri}"
+                )
+                # Still allow HTTP for development, but log warning
+                # In strict production mode, this should return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Error validating URI structure for {uri}: {e}")
+            return False
+
     def validate_redirect_uri(self, uri: str) -> bool:
         """
         Validate if a redirect URI is allowed.
+
+        Performs both structural validation and allowlist checking.
 
         Args:
             uri: The redirect URI to validate
@@ -200,8 +268,22 @@ class OAuthConfig:
         Returns:
             True if the URI is allowed, False otherwise
         """
+        # First validate URI structure
+        if not self._validate_uri_structure(uri):
+            logger.error(f"SECURITY: Redirect URI failed structure validation: {uri}")
+            return False
+
+        # Then check if it's in the allowed list
         allowed_uris = self.get_redirect_uris()
-        return uri in allowed_uris
+        is_allowed = uri in allowed_uris
+
+        if not is_allowed:
+            logger.warning(
+                f"SECURITY: Redirect URI not in allowed list: {uri}. "
+                f"Allowed URIs: {allowed_uris}"
+            )
+
+        return is_allowed
 
     def get_environment_summary(self) -> dict:
         """
@@ -358,32 +440,39 @@ class OAuthConfig:
 
 # Global configuration instance
 _oauth_config = None
+_oauth_config_lock = threading.Lock()
 
 
 def get_oauth_config() -> OAuthConfig:
     """
-    Get the global OAuth configuration instance.
+    Get the global OAuth configuration instance (thread-safe).
 
     Returns:
         The singleton OAuth configuration instance
     """
     global _oauth_config
     if _oauth_config is None:
-        _oauth_config = OAuthConfig()
+        with _oauth_config_lock:
+            # Double-check locking pattern to avoid race conditions
+            if _oauth_config is None:
+                _oauth_config = OAuthConfig()
     return _oauth_config
 
 
 def reload_oauth_config() -> OAuthConfig:
     """
-    Reload the OAuth configuration from environment variables.
+    Reload the OAuth configuration from environment variables (thread-safe).
 
     This is useful for testing or when environment variables change.
+    Note: This should only be called during startup or in test scenarios,
+    not during normal operation with concurrent requests.
 
     Returns:
         The reloaded OAuth configuration instance
     """
     global _oauth_config
-    _oauth_config = OAuthConfig()
+    with _oauth_config_lock:
+        _oauth_config = OAuthConfig()
     return _oauth_config
 
 
